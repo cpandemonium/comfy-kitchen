@@ -56,9 +56,21 @@ def test_dense_full_refiner_attention_matches_original_fp16_math():
             del probabilities
         reference = result.reshape(1,32,40480,128).permute(0,2,1,3).reshape(1,40480,4096)
         del q,k,v,result
-        output = attention.long_attention(*values, 32, fused_softmax=False)
+        torch.cuda.reset_peak_memory_stats()
+        allocated_before = torch.cuda.memory_allocated()
+        control = attention.long_attention(*values, 32, fused_softmax=False, inplace_softmax=False)
+        control_extra = torch.cuda.max_memory_allocated() - allocated_before
+        torch.testing.assert_close(control, reference, rtol=0, atol=0)
+        del control
+        torch.cuda.reset_peak_memory_stats()
+        allocated_before = torch.cuda.memory_allocated()
+        output = attention.long_attention(*values, 32, fused_softmax=False, inplace_softmax=True)
+        candidate_extra = torch.cuda.max_memory_allocated() - allocated_before
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        # Score/probability aliasing must remove a real temporary allocation,
+        # not merely advertise a lower budget to the caller.
+        assert control_extra - candidate_extra > 2 * 1024**3
         fused = attention.long_attention(*values, 32, fused_softmax=True)
         assert torch.isfinite(fused).all()
         torch.testing.assert_close(fused, output, rtol=1e-3, atol=1e-3)

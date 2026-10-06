@@ -14,6 +14,7 @@ DEFAULT_VARIANT = dict(
     query_chunk=4096,
     contiguous_k=False,
     fused_softmax=os.environ.get("MI50_LTX_FUSED_SOFTMAX", "0") == "1",
+    inplace_softmax=True,
 )
 
 
@@ -59,11 +60,14 @@ def _softmax_kernel():
 
 
 def long_attention(q, k, v, heads=32, scale=None, max_score_bytes=2**32,
-                   fused_softmax=False, contiguous_k=False, head_chunk=8, query_chunk=4096):
+                   fused_softmax=False, contiguous_k=False, head_chunk=8, query_chunk=4096,
+                   inplace_softmax=True):
     """Validated dense FP16 inference; caller must check can_use first.
 
     max_score_bytes bounds one score/probability buffer, not total live memory.
-    There are two such buffers plus Q/K/V and output; pass a free-memory budget.
+    In-place PyTorch softmax reuses the score storage and retains its reduction
+    algorithm. The experimental fused path still needs two buffers. Callers
+    must also account for packed Q/K/V and output when sizing the budget.
     """
     if not can_use(q, k, v, heads):
         raise ValueError("MI50 long_attention requires the validated gfx906 FP16 inference shape")
@@ -93,7 +97,10 @@ def long_attention(q, k, v, heads=32, scale=None, max_score_bytes=2**32,
                 kernel[(scores.numel()//n,)](scores, probabilities, n, scale, 65536, num_warps=8)
             else:
                 scores.mul_(scale)
-                probabilities = scores.softmax(-1)
+                if inplace_softmax:
+                    probabilities = torch.softmax(scores, dim=-1, out=scores)
+                else:
+                    probabilities = scores.softmax(-1)
             del scores
             torch.bmm(probabilities, v[h:h+head_chunk],
                       out=output[h:h+head_chunk, start:start+query_chunk])
