@@ -15,6 +15,7 @@ never materialized on CUDA.
 """
 
 import math
+import os
 
 import torch
 import torch.nn.functional as functional
@@ -26,6 +27,36 @@ from comfy_kitchen.registry import registry
 NA_SCORE_BUDGET = 2 ** 25
 # Element budget for the stacked K/V copies of one batched SDPA call on CUDA.
 NA_KV_STACK_BUDGET = 2 ** 28
+
+
+def _use_mi50_fast_math(q, k, v):
+    """Only the validated gfx906 inference path; other backends keep SDPA."""
+    return (
+        os.environ.get("MI50_NA_FAST_MATH", "1") == "1"
+        and torch.version.hip is not None
+        and q.device.type == "cuda"
+        and q.dtype == k.dtype == v.dtype == torch.float16
+        and not torch.is_grad_enabled()
+        and torch.backends.cuda.math_sdp_enabled()
+        and torch.backends.cuda.fp16_bf16_reduction_math_sdp_allowed()
+        and not torch.backends.cuda.flash_sdp_enabled()
+        and not torch.backends.cuda.mem_efficient_sdp_enabled()
+        and not torch.backends.cuda.cudnn_sdp_enabled()
+        and torch.cuda.get_device_properties(q.device).gcnArchName.startswith("gfx906")
+    )
+
+
+def _finite_mask_attention(q, k, v, mask):
+    """NA-only math attention, with q already scaled by na3d.
+
+    _group_mask creates finite additive masks, and every query has a valid
+    neighborhood. For finite logits, softmax cannot have an all--inf row,
+    so the generic SDPA safe-softmax scans and selection are unnecessary.
+    This helper is not a replacement for general masked/causal SDPA.
+    """
+    scores = torch.matmul(q, k.transpose(-2, -1))
+    scores.add_(mask)
+    return torch.matmul(torch.softmax(scores, dim=-1), v)
 
 
 def _window_bounds(length, kernel, causal):
@@ -104,6 +135,8 @@ def na3d(
     if scale != 1.0:
         q = q * scale
 
+    use_fast_math = _use_mi50_fast_math(q, k, v)
+
     bounds = [_window_bounds(d, k_, c) for d, k_, c in zip(dims, kernels, causal, strict=True)]
     tile_t, tile_h, tile_w = _pick_tiles(dims, [min(k_, d) for k_, d in zip(kernels, dims, strict=True)])
 
@@ -131,10 +164,14 @@ def na3d(
     for rel, tiles in groups.items():
         mask = _group_mask(rel, q.dtype, device)
         nq, nk = mask.shape[2], mask.shape[3]
-        if device.type == "cuda":
+        if device.type == "cuda" and (
+            torch.backends.cuda.flash_sdp_enabled()
+            or torch.backends.cuda.mem_efficient_sdp_enabled()
+            or torch.backends.cuda.cudnn_sdp_enabled()
+        ):
             g_max = max(1, NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2))
         else:
-            g_max = 1  # CPU math backend materializes [G*B, NH, Nq, Nk]
+            g_max = 1  # Math SDPA materializes [G*B, NH, Nq, Nk], also on ROCm.
         qs0, _ = tiles[0]
         tq, th, tw = (qs0[0].stop - qs0[0].start, qs0[1].stop - qs0[1].start, qs0[2].stop - qs0[2].start)
         for c0 in range(0, len(tiles), g_max):
@@ -147,7 +184,10 @@ def na3d(
             q_s = q_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * batch, nh, nq, hd)
             k_s = k_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * batch, nh, nk, hd)
             v_s = v_s.permute(0, 1, 5, 2, 3, 4, 6).reshape(g * batch, nh, nk, hd)
-            o = functional.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=mask, scale=1.0)
+            if use_fast_math:
+                o = _finite_mask_attention(q_s, k_s, v_s, mask)
+            else:
+                o = functional.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=mask, scale=1.0)
             o = o.view(g, batch, nh, tq, th, tw, hd).permute(0, 1, 3, 4, 5, 2, 6)
             for i, (qs, _) in enumerate(chunk):
                 out[:, qs[0], qs[1], qs[2]] = o[i]
