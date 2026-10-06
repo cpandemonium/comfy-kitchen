@@ -27,6 +27,10 @@ from comfy_kitchen.registry import registry
 NA_SCORE_BUDGET = 2 ** 25
 # Element budget for the stacked K/V copies of one batched SDPA call on CUDA.
 NA_KV_STACK_BUDGET = 2 ** 28
+# Fast-math still materializes scores; keep a reserve matching ComfyUI --reserve-vram.
+NA_MATH_GROUP_RESERVE = 3 * 1024 ** 3
+# Large groups on gfx906 become memory-bound; 4 was the fastest safe VAE tile.
+NA_MATH_GROUP_MAX = 4
 
 
 def _use_mi50_fast_math(q, k, v):
@@ -44,6 +48,35 @@ def _use_mi50_fast_math(q, k, v):
         and not torch.backends.cuda.cudnn_sdp_enabled()
         and torch.cuda.get_device_properties(q.device).gcnArchName.startswith("gfx906")
     )
+
+
+def _cuda_free_bytes(device):
+    free, _total = torch.cuda.mem_get_info(device)
+    return int(free)
+
+
+def _group_limit(batch, nh, nq, nk, hd, dtype, device, use_fast_math):
+    """How many same-geometry tiles may share one attention call.
+
+    Efficient CUDA SDPA keeps the original K/V stack budget. Math SDPA without
+    the MI50 fast path stays at one tile: it materializes [G*B, NH, Nq, Nk].
+    Fast-math uses the same scores but sizes G from currently free VRAM.
+    """
+    if device.type == "cuda" and (
+        torch.backends.cuda.flash_sdp_enabled()
+        or torch.backends.cuda.mem_efficient_sdp_enabled()
+        or torch.backends.cuda.cudnn_sdp_enabled()
+    ):
+        return max(1, NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2))
+    if not use_fast_math:
+        return 1
+    elem = torch.empty((), dtype=dtype).element_size()
+    # Stacked Q/K/V plus scores and an out-of-place softmax, with allocator slack.
+    per = batch * nh * elem * (nq * hd + 2 * nk * hd + 2 * nq * nk)
+    per = max(1, int(per * 1.5))
+    budget = max(0, _cuda_free_bytes(device) - NA_MATH_GROUP_RESERVE)
+    kv_cap = max(1, NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2))
+    return max(1, min(NA_MATH_GROUP_MAX, kv_cap, budget // per))
 
 
 def _finite_mask_attention(q, k, v, mask):
@@ -164,14 +197,7 @@ def na3d(
     for rel, tiles in groups.items():
         mask = _group_mask(rel, q.dtype, device)
         nq, nk = mask.shape[2], mask.shape[3]
-        if device.type == "cuda" and (
-            torch.backends.cuda.flash_sdp_enabled()
-            or torch.backends.cuda.mem_efficient_sdp_enabled()
-            or torch.backends.cuda.cudnn_sdp_enabled()
-        ):
-            g_max = max(1, NA_KV_STACK_BUDGET // max(1, batch * nh * nk * hd * 2))
-        else:
-            g_max = 1  # Math SDPA materializes [G*B, NH, Nq, Nk], also on ROCm.
+        g_max = _group_limit(batch, nh, nq, nk, hd, q.dtype, device, use_fast_math)
         qs0, _ = tiles[0]
         tq, th, tw = (qs0[0].stop - qs0[0].start, qs0[1].stop - qs0[1].start, qs0[2].stop - qs0[2].start)
         for c0 in range(0, len(tiles), g_max):

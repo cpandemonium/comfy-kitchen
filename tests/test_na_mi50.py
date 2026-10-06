@@ -80,6 +80,45 @@ def test_math_groups_do_not_stack_query_tiles(monkeypatch):
     assert max(batch_sizes) == 2  # Input batch B, not multiple tile groups times B.
 
 
+@pytest.mark.skipif(not _gfx906_available(), reason="requires a real HIP gfx906 GPU")
+def test_fast_math_groups_stack_when_memory_allows(monkeypatch):
+    tensors = [torch.randn(1, 8, 16, 16, 4, 8, device="cuda", dtype=torch.float16)
+               for _ in range(3)]
+    monkeypatch.setenv("MI50_NA_FAST_MATH", "1")
+    monkeypatch.setattr(na, "NA_SCORE_BUDGET", 4096)
+    monkeypatch.setattr(na, "_cuda_free_bytes", lambda device: 32 * 1024 ** 3)
+    batches = []
+    original = na._finite_mask_attention
+
+    def recording_fast(q, k, v, mask):
+        batches.append(q.shape[0])
+        return original(q, k, v, mask)
+
+    monkeypatch.setattr(na, "_finite_mask_attention", recording_fast)
+    with _math_only(), torch.inference_mode():
+        assert na._use_mi50_fast_math(*tensors)
+        output = na.na3d(*tensors, kernel_size=[3, 3, 3])
+    assert torch.isfinite(output).all()
+    assert batches
+    assert max(batches) > tensors[0].shape[0]
+
+
+@pytest.mark.skipif(not _gfx906_available(), reason="requires a real HIP gfx906 GPU")
+def test_fast_math_grouped_matches_ungrouped(monkeypatch):
+    torch.manual_seed(42)
+    tensors = [torch.randn(1, 8, 16, 16, 4, 8, device="cuda", dtype=torch.float16)
+               for _ in range(3)]
+    monkeypatch.setenv("MI50_NA_FAST_MATH", "1")
+    monkeypatch.setattr(na, "NA_SCORE_BUDGET", 4096)
+    with _math_only(), torch.inference_mode():
+        monkeypatch.setattr(na, "_cuda_free_bytes", lambda device: 0)
+        ungrouped = na.na3d(*tensors, kernel_size=[3, 3, 3])
+        monkeypatch.setattr(na, "_cuda_free_bytes", lambda device: 32 * 1024 ** 3)
+        grouped = na.na3d(*tensors, kernel_size=[3, 3, 3])
+    assert torch.isfinite(grouped).all()
+    torch.testing.assert_close(grouped, ungrouped, rtol=1e-3, atol=1e-3)
+
+
 def test_training_fp32_preserves_outputs_and_gradients(monkeypatch):
     torch.manual_seed(42)
     values = [torch.randn(1, 2, 3, 4, 2, 8) for _ in range(3)]

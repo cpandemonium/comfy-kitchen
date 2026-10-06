@@ -5,10 +5,16 @@ PyTorch softmax because reduction trees and exp implementations differ.
 Triton is used only for a Wave64 scale/softmax kernel, not matrix products.
 """
 from functools import lru_cache
+import os
 
 import torch
 
-DEFAULT_VARIANT = dict(head_chunk=8, query_chunk=4096, contiguous_k=False, fused_softmax=False)
+DEFAULT_VARIANT = dict(
+    head_chunk=8,
+    query_chunk=4096,
+    contiguous_k=False,
+    fused_softmax=os.environ.get("MI50_LTX_FUSED_SOFTMAX", "0") == "1",
+)
 
 
 def can_use(q, k, v, heads, mask=None, attn_precision=None, **kwargs):
@@ -39,12 +45,16 @@ def _softmax_kernel():
     def kernel(X, Y, N: tl.constexpr, SCALE: tl.constexpr, BLOCK: tl.constexpr):
         row = tl.program_id(0).to(tl.int64)
         columns = tl.arange(0, BLOCK)
-        values = tl.load(X + row*N + columns, columns < N, other=0).to(tl.float32)
-        values = (values*SCALE).to(tl.float16).to(tl.float32)
-        values = tl.where(columns < N, values, -float("inf"))
-        numerator = tl.exp(values-tl.max(values, 0))
-        result = numerator/tl.sum(numerator, 0)
-        tl.store(Y + row*N + columns, result, columns < N)
+        in_row = columns < N
+        # Match PyTorch: fp16 scale, then fp32 max/exp/sum. Mask before the
+        # reduction so padding cannot change the row max or the partition.
+        values = tl.load(X + row * N + columns, mask=in_row, other=0).to(tl.float32)
+        values = (values * SCALE).to(tl.float16).to(tl.float32)
+        values = tl.where(in_row, values, float("-inf"))
+        shifted = values - tl.max(values, 0)
+        numerator = tl.where(in_row, tl.exp(shifted), 0.0)
+        result = numerator / tl.sum(numerator, 0)
+        tl.store(Y + row * N + columns, result, mask=in_row)
     return kernel
 
 
