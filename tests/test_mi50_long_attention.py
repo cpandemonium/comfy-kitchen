@@ -71,6 +71,9 @@ def test_dense_full_refiner_attention_matches_original_fp16_math():
         # Score/probability aliasing must remove a real temporary allocation,
         # not merely advertise a lower budget to the caller.
         assert control_extra - candidate_extra > 2 * 1024**3
+        ordered = attention.long_attention(*values, 32, ordered_softmax=True)
+        torch.testing.assert_close(ordered, output, rtol=0, atol=0)
+        del ordered
         fused = attention.long_attention(*values, 32, fused_softmax=True)
         assert torch.isfinite(fused).all()
         torch.testing.assert_close(fused, output, rtol=1e-3, atol=1e-3)

@@ -15,6 +15,7 @@ DEFAULT_VARIANT = dict(
     contiguous_k=False,
     fused_softmax=os.environ.get("MI50_LTX_FUSED_SOFTMAX", "0") == "1",
     inplace_softmax=True,
+    ordered_softmax=False,
 )
 
 
@@ -61,7 +62,7 @@ def _softmax_kernel():
 
 def long_attention(q, k, v, heads=32, scale=None, max_score_bytes=2**32,
                    fused_softmax=False, contiguous_k=False, head_chunk=8, query_chunk=4096,
-                   inplace_softmax=True):
+                   inplace_softmax=True, ordered_softmax=False):
     """Validated dense FP16 inference; caller must check can_use first.
 
     max_score_bytes bounds one score/probability buffer, not total live memory.
@@ -71,6 +72,8 @@ def long_attention(q, k, v, heads=32, scale=None, max_score_bytes=2**32,
     """
     if not can_use(q, k, v, heads):
         raise ValueError("MI50 long_attention requires the validated gfx906 FP16 inference shape")
+    if fused_softmax and ordered_softmax:
+        raise ValueError("fused_softmax and ordered_softmax are mutually exclusive")
     if max_score_bytes < 40480 * 2:
         raise ValueError("max_score_bytes cannot hold even one attention row")
     b, n, c = q.shape
@@ -92,7 +95,10 @@ def long_attention(q, k, v, heads=32, scale=None, max_score_bytes=2**32,
         for start in range(0, n, query_chunk):
             qs = q[h:h+head_chunk, start:start+query_chunk]
             scores = torch.bmm(qs, kt[h:h+head_chunk])
-            if fused_softmax:
+            if ordered_softmax:
+                from comfy_kitchen.backends.triton.mi50_softmax import scale_softmax_inplace
+                probabilities = scale_softmax_inplace(scores, scale)
+            elif fused_softmax:
                 probabilities = torch.empty_like(scores)
                 kernel[(scores.numel()//n,)](scores, probabilities, n, scale, 65536, num_warps=8)
             else:

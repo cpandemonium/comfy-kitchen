@@ -1085,6 +1085,22 @@ def int8_linear(
     def grid(meta):
         return (triton.cdiv(m, meta["block_m"]) * triton.cdiv(n, meta["block_n"]),)
 
+    from comfy_kitchen.backends.triton.mi50_int8 import select_config
+    fixed_config = select_config(x_2d, weight, out_dtype)
+    kernel = (_int8_matmul_dequant_per_row_kernel if is_per_channel
+              else _int8_matmul_dequant_kernel)
+    if fixed_config is not None:
+        kernel.fn[grid](
+            a_ptr=x_int8, b_ptr=weight, c_ptr=output,
+            a_scale_ptr=x_scale, b_scale_ptr=weight_scale, bias_ptr=bias_ptr,
+            m=m, n=n, k=k,
+            stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
+            stride_bk=weight.stride(1), stride_bn=weight.stride(0),
+            stride_cm=output.stride(0), stride_cn=output.stride(1),
+            has_bias=has_bias, **fixed_config,
+        )
+        return _apply_residual(output.reshape(*orig_shape[:-1], n), residual, residual_scale)
+
     if is_per_channel:
         _int8_matmul_dequant_per_row_kernel[grid](
             a_ptr=x_int8,
