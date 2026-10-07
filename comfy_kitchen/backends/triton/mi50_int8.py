@@ -1,4 +1,4 @@
-"""Measured exact INT8 tiles for MI50 LTX and FP32 MiniMax inference."""
+"""Measured exact INT8 tiles for MI50 LTX, MiniMax transformer and video VAE."""
 
 import os
 import torch
@@ -17,6 +17,13 @@ _CONFIG = {
     "num_stages": 2,
 }
 _MINIMAX_NK = {(21504, 5376), (28672, 5376), (5376, 14336), (5376, 7168)}
+_VAE_SHAPES = {
+    (m, n, k)
+    for m in (3594, 7188)
+    for n, k in ((16384, 2048), (2048, 8192), (6144, 2048), (2048, 2048))
+}
+_VAE_SMALL = {(3594, 2048, 8192), (3594, 2048, 2048)}
+_VAE_SMALL_CONFIG = dict(_CONFIG, block_n=128, block_k=64, num_warps=4)
 
 
 def select_config(x, weight, out_dtype):
@@ -47,8 +54,15 @@ def select_config(x, weight, out_dtype):
         and 52672 <= x.shape[0] <= 55040
         and tuple(weight.shape) in _MINIMAX_NK
     )
-    if not (ltx or minimax):
+    shape = (x.shape[0], weight.shape[0], x.shape[1])
+    vae = (
+        os.environ.get("MI50_MINIMAX_VAE_INT8_TILES", "0") == "1"
+        and x.dtype == torch.float16
+        and out_dtype == torch.float16
+        and shape in _VAE_SHAPES
+    )
+    if not (ltx or minimax or vae):
         return None
     if not torch.cuda.get_device_properties(x.device).gcnArchName.startswith("gfx906"):
         return None
-    return dict(_CONFIG)
+    return dict(_VAE_SMALL_CONFIG if vae and shape in _VAE_SMALL else _CONFIG)

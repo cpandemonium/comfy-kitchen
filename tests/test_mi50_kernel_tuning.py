@@ -124,3 +124,51 @@ def test_minimax_exact_convrot_bias_and_residual(per_channel, monkeypatch):
         monkeypatch.setenv("MI50_MINIMAX_INT8_TILES", "1")
         result = int8_linear(x, weight, scale, **kwargs)
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _gfx906(), reason="requires gfx906")
+def test_minimax_vae_scope_is_independent(monkeypatch):
+    monkeypatch.setenv("MI50_LTX_INT8_TILES", "0")
+    monkeypatch.setenv("MI50_MINIMAX_INT8_TILES", "0")
+    monkeypatch.setenv("MI50_MINIMAX_VAE_INT8_TILES", "1")
+    x = torch.empty(7189, 2048, device="cuda", dtype=torch.float16)
+    weight = torch.empty(2048, 2048, device="cuda", dtype=torch.int8)
+    assert select_config(x[:7188], weight, torch.float16) is None
+    with torch.inference_mode():
+        assert select_config(x[:7188], weight, torch.float16)["block_k"] == 32
+        assert select_config(x[:3594], weight, torch.float16)["block_k"] == 64
+        assert select_config(x[:3593], weight, torch.float16) is None
+        assert select_config(x, weight, torch.float16) is None
+        assert select_config(x[:7188], weight, torch.float32) is None
+        assert select_config(x[:7188].float(), weight, torch.float16) is None
+        assert select_config(x[:7188, ::2], weight[:, :1024], torch.float16) is None
+        assert select_config(x[:7188], weight[:1], torch.float16) is None
+        monkeypatch.setenv("MI50_MINIMAX_VAE_INT8_TILES", "0")
+        assert select_config(x[:7188], weight, torch.float16) is None
+
+
+@pytest.mark.skipif(not _gfx906(), reason="requires gfx906")
+@pytest.mark.parametrize("per_channel", [False, True])
+@pytest.mark.parametrize("tokens", [3594, 7188])
+def test_minimax_vae_exact_convrot_rmsnorm_residual(tokens, per_channel, monkeypatch):
+    torch.manual_seed(57)
+    with torch.inference_mode():
+        x = torch.randn(tokens, 2048, device="cuda", dtype=torch.float16) * 0.15
+        weight = torch.randint(-127, 128, (2048, 2048), device="cuda", dtype=torch.int8)
+        scale = torch.full((2048,) if per_channel else (1,), 0.0002, device="cuda")
+        kwargs = {
+            "bias": torch.randn(2048, device="cuda", dtype=torch.float16) * 0.05,
+            "out_dtype": torch.float16,
+            "convrot": True,
+            "input_act": "rms_norm",
+            "input_act_weight": torch.ones(2048, device="cuda", dtype=torch.float16),
+            "input_act_eps": 1e-6,
+            "residual": x * 0.1,
+            "residual_scale": torch.full((2048,), 0.8, device="cuda", dtype=torch.float16),
+        }
+        monkeypatch.setenv("MI50_MINIMAX_VAE_INT8_TILES", "0")
+        reference = int8_linear(x, weight, scale, **kwargs)
+        monkeypatch.setenv("MI50_MINIMAX_VAE_INT8_TILES", "1")
+        result = int8_linear(x, weight, scale, **kwargs)
+        assert bool(torch.isfinite(result).all())
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
