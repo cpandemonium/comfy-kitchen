@@ -83,3 +83,44 @@ def test_ordered_softmax_exact_and_inplace():
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
         with pytest.raises(ValueError, match="contiguous"):
             scale_softmax_inplace(scores[:, :40000], 128**-0.5)
+
+
+@pytest.mark.skipif(not _gfx906(), reason="requires gfx906")
+def test_minimax_scope_is_independent_of_ltx(monkeypatch):
+    monkeypatch.setenv("MI50_LTX_INT8_TILES", "0")
+    monkeypatch.setenv("MI50_MINIMAX_INT8_TILES", "1")
+    x = torch.empty(55041, 5376, device="cuda", dtype=torch.float32)
+    weight = torch.empty(21504, 5376, device="cuda", dtype=torch.int8)
+    assert select_config(x[:52708], weight, torch.float32) is None
+    with torch.inference_mode():
+        assert select_config(x[:52708], weight, torch.float32)["block_k"] == 32
+        assert select_config(x[:52671], weight, torch.float32) is None
+        assert select_config(x, weight, torch.float32) is None
+        assert select_config(x[:52708], weight, torch.float16) is None
+        assert select_config(x[:52708], weight[:1], torch.float32) is None
+        monkeypatch.setenv("MI50_MINIMAX_INT8_TILES", "0")
+        assert select_config(x[:52708], weight, torch.float32) is None
+
+
+@pytest.mark.skipif(not _gfx906(), reason="requires gfx906")
+@pytest.mark.parametrize("per_channel", [False, True])
+def test_minimax_exact_convrot_bias_and_residual(per_channel, monkeypatch):
+    torch.manual_seed(42)
+    with torch.inference_mode():
+        x = torch.randn(52708, 7168, device="cuda", dtype=torch.float32) * 0.15
+        weight = torch.randint(-127, 128, (5376, 7168), device="cuda", dtype=torch.int8)
+        scale = torch.full((5376,) if per_channel else (1,), 0.0002, device="cuda")
+        bias = torch.randn(5376, device="cuda") * 0.05
+        residual = torch.randn(52708, 5376, device="cuda") * 0.1
+        kwargs = {
+            "bias": bias,
+            "out_dtype": torch.float32,
+            "convrot": True,
+            "residual": residual,
+            "residual_scale": torch.full((5376,), 0.8, device="cuda"),
+        }
+        monkeypatch.setenv("MI50_MINIMAX_INT8_TILES", "0")
+        reference = int8_linear(x, weight, scale, **kwargs)
+        monkeypatch.setenv("MI50_MINIMAX_INT8_TILES", "1")
+        result = int8_linear(x, weight, scale, **kwargs)
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
