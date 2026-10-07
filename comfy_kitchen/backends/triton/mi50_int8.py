@@ -1,14 +1,12 @@
-"""Measured tiles for FP16 ConvRot INT8 inference on the MI50 LTX refiner."""
+"""Measured tiles for FP16 ConvRot INT8 inference on both MI50 LTX video passes."""
 
 import os
 import torch
 
 _SHAPES = {
-    (40480, 16384, 4096),
-    (40480, 2048, 4096),
-    (40480, 4096, 16384),
-    (40480, 4096, 2048),
-    (40480, 4096, 4096),
+    (m, n, k)
+    for m in (10120, 40480)
+    for n, k in ((16384, 4096), (2048, 4096), (4096, 16384), (4096, 2048), (4096, 4096))
 }
 _CONFIG = {
     "block_m": 128,

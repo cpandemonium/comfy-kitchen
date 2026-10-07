@@ -35,7 +35,8 @@ def test_int8_scope(monkeypatch):
     assert select_config(x, weight, torch.float16) is None  # Training/grad mode.
     with torch.inference_mode():
         assert select_config(x, weight, torch.float16)["block_k"] == 32
-        assert select_config(x[:10120], weight, torch.float16) is None
+        assert select_config(x[:10120], weight, torch.float16)["block_k"] == 32
+        assert select_config(x[:10119], weight, torch.float16) is None
         assert select_config(x, weight, torch.float32) is None
         assert select_config(x[:, ::2], weight[:, :2048], torch.float16) is None
         monkeypatch.setenv("MI50_LTX_INT8_TILES", "0")
@@ -44,10 +45,11 @@ def test_int8_scope(monkeypatch):
 
 @pytest.mark.skipif(not _gfx906(), reason="requires gfx906")
 @pytest.mark.parametrize("per_channel", [False, True])
-def test_exact_int8_epilogue_and_residual(per_channel, monkeypatch):
+@pytest.mark.parametrize("tokens", [10120, 40480])
+def test_exact_int8_epilogue_and_residual(per_channel, tokens, monkeypatch):
     torch.manual_seed(37)
     with torch.inference_mode():
-        x = torch.randn(40480, 4096, device="cuda", dtype=torch.float16) * 0.15
+        x = torch.randn(tokens, 4096, device="cuda", dtype=torch.float16) * 0.15
         weight = torch.randint(-127, 128, (4096, 4096), device="cuda", dtype=torch.int8)
         scale = torch.full((4096,) if per_channel else (1,), 0.0002, device="cuda")
         bias = torch.randn(4096, device="cuda", dtype=torch.float16) * 0.05
