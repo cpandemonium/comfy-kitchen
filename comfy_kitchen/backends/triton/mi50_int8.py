@@ -80,15 +80,3 @@ def use_chunked_convrot(x, weight, out_dtype, group_size=256):
         and out_dtype == torch.float32
     )
 
-
-def use_nolicm_vae_gemm(x, weight, out_dtype):
-    """Test only the two dominant measured video VAE fc1 shapes."""
-    return (
-        os.environ.get("MI50_MINIMAX_VAE_GEMM_NO_LICM", "0") == "1"
-        and x.shape[0] in (3594, 7188)
-        and tuple(weight.shape) == (16384, 2048)
-        and x.dtype == torch.float16
-        and out_dtype == torch.float16
-        and not torch.is_autocast_enabled("cuda")
-        and select_config(x, weight, out_dtype) is not None
-    )

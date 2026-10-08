@@ -1017,142 +1017,7 @@ def _int8_matmul_dequant_per_row_kernel(
     c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
     tl.store(c_ptrs, c, mask=c_mask)
 
-@triton.jit
-def _int8_matmul_dequant_kernel_nolicm(
-    # Pointers
-    a_ptr, b_ptr, c_ptr,
-    a_scale_ptr, b_scale_ptr, bias_ptr,
-    # Matrix Dimensions
-    m, n, k,
-    # Strides
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    # Meta-parameters
-    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
-    group_size_m: tl.constexpr,
-    has_bias: tl.constexpr
-):
-    """
-    Computes: C = ((A * B) * (scale_a * scale_b)) + bias
-    A: [m, k] int8
-    B: [n, k] int8 (Transposed physically or logically via strides)
-    """
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(m, block_m)
-    num_pid_n = tl.cdiv(n, block_n)
-    num_pid_in_group = group_size_m * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * group_size_m
-    actual_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
-    pid_m = first_pid_m + (pid % actual_group_size_m)
-    pid_n = (pid % num_pid_in_group) // actual_group_size_m
 
-    # 1. Prepare Pointers for A and B
-    offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
-    offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
-    offs_k = tl.arange(0, block_k)
-
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    # 2. Main Loop (Accumulate in Int32)
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
-
-    for k_idx in tl.range(0, tl.cdiv(k, block_k), disable_licm=True):
-        # Load chunks
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < k - k_idx * block_k, other=0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k - k_idx * block_k, other=0)
-
-        # Matrix Multiply
-        accumulator += tl.dot(a, b)
-
-        # Advance pointers
-        a_ptrs += block_k * stride_ak
-        b_ptrs += block_k * stride_bk
-
-    # 3. Fused Epilogue (Dequantize & Bias)
-    scale_a = tl.load(a_scale_ptr + offs_am) # Vector [BLOCK_M]
-    scale_b = tl.load(b_scale_ptr)
-
-    c = accumulator.to(tl.float32)
-    total_scale = scale_a[:, None] * scale_b
-    c = c * total_scale
-
-    if has_bias:
-        bias = tl.load(bias_ptr + offs_bn) # Vector [BLOCK_N]
-        c = c + bias[None, :]
-
-    # 4. Store Result
-    c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
-    tl.store(c_ptrs, c, mask=c_mask)
-
-@triton.jit
-def _int8_matmul_dequant_per_row_kernel_nolicm(
-    # Pointers
-    a_ptr, b_ptr, c_ptr,
-    a_scale_ptr, b_scale_ptr, bias_ptr,
-    # Matrix Dimensions
-    m, n, k,
-    # Strides
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    # Meta-parameters
-    block_m: tl.constexpr, block_n: tl.constexpr, block_k: tl.constexpr,
-    group_size_m: tl.constexpr,
-    has_bias: tl.constexpr
-):
-    """
-    Computes: C = ((A * B) * (scale_a[:, None] * scale_b[None, :])) + bias
-    A: [m, k] int8, scale_a: [m, 1] per-row activation scales
-    B: [n, k] int8, scale_b: [n, 1] per-row weight scales
-    """
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(m, block_m)
-    num_pid_n = tl.cdiv(n, block_n)
-    num_pid_in_group = group_size_m * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * group_size_m
-    actual_group_size_m = min(num_pid_m - first_pid_m, group_size_m)
-    pid_m = first_pid_m + (pid % actual_group_size_m)
-    pid_n = (pid % num_pid_in_group) // actual_group_size_m
-
-    # 1. Prepare Pointers for A and B
-    offs_am = (pid_m * block_m + tl.arange(0, block_m)) % m
-    offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
-    offs_k = tl.arange(0, block_k)
-
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-
-    # 2. Main Loop (Accumulate in Int32)
-    accumulator = tl.zeros((block_m, block_n), dtype=tl.int32)
-
-    for k_idx in tl.range(0, tl.cdiv(k, block_k), disable_licm=True):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < k - k_idx * block_k, other=0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < k - k_idx * block_k, other=0)
-        accumulator += tl.dot(a, b)
-        a_ptrs += block_k * stride_ak
-        b_ptrs += block_k * stride_bk
-
-    # 3. Fused Epilogue (Dequantize & Bias)
-    scale_a = tl.load(a_scale_ptr + offs_am)  # Vector [BLOCK_M]
-    scale_b = tl.load(b_scale_ptr + offs_bn)  # Vector [BLOCK_N]
-
-    c = accumulator.to(tl.float32)
-    total_scale = scale_a[:, None] * scale_b[None, :]
-    c = c * total_scale
-
-    if has_bias:
-        bias = tl.load(bias_ptr + offs_bn)
-        c = c + bias[None, :]
-
-    # 4. Store Result
-    c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
-    c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
-    tl.store(c_ptrs, c, mask=c_mask)
 
 def _quantize_convrot_chunked(x, h, group_size, chunk_rows=2048):
     """Retain native FP32 rotation and row quantization without full rotated x."""
@@ -1255,14 +1120,8 @@ def int8_linear(
     fixed_config = select_config(x_2d, weight, out_dtype)
     kernel = (_int8_matmul_dequant_per_row_kernel if is_per_channel
               else _int8_matmul_dequant_kernel)
-    from comfy_kitchen.backends.triton.mi50_int8 import use_nolicm_vae_gemm
-    use_no_licm = use_nolicm_vae_gemm(x_2d, weight, out_dtype)
-    if use_no_licm:
-        kernel = (_int8_matmul_dequant_per_row_kernel_nolicm if is_per_channel
-                  else _int8_matmul_dequant_kernel_nolicm)
     if fixed_config is not None:
-        measured_kernel = kernel if use_no_licm else kernel.fn
-        measured_kernel[grid](
+        kernel.fn[grid](
             a_ptr=x_int8, b_ptr=weight, c_ptr=output,
             a_scale_ptr=x_scale, b_scale_ptr=weight_scale, bias_ptr=bias_ptr,
             m=m, n=n, k=k,
