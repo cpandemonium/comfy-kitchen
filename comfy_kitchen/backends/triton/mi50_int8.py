@@ -66,3 +66,29 @@ def select_config(x, weight, out_dtype):
     if not torch.cuda.get_device_properties(x.device).gcnArchName.startswith("gfx906"):
         return None
     return dict(_VAE_SMALL_CONFIG if vae and shape in _VAE_SMALL else _CONFIG)
+
+
+def use_chunked_convrot(x, weight, out_dtype, group_size=256):
+    """Limit the memory change to the measured FP32 MiniMax fc2 projection."""
+    return (
+        os.environ.get("MI50_MINIMAX_CONVROT_CHUNKED", "0") == "1"
+        and group_size == 256
+        and not torch.is_autocast_enabled("cuda")
+        and tuple(weight.shape) == (5376, 14336)
+        and select_config(x, weight, out_dtype) is not None
+        and x.dtype == torch.float32
+        and out_dtype == torch.float32
+    )
+
+
+def use_nolicm_vae_gemm(x, weight, out_dtype):
+    """Test only the two dominant measured video VAE fc1 shapes."""
+    return (
+        os.environ.get("MI50_MINIMAX_VAE_GEMM_NO_LICM", "0") == "1"
+        and x.shape[0] in (3594, 7188)
+        and tuple(weight.shape) == (16384, 2048)
+        and x.dtype == torch.float16
+        and out_dtype == torch.float16
+        and not torch.is_autocast_enabled("cuda")
+        and select_config(x, weight, out_dtype) is not None
+    )
