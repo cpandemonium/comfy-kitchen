@@ -173,3 +173,27 @@ def test_minimax_vae_exact_convrot_rmsnorm_residual(tokens, per_channel, monkeyp
         result = int8_linear(x, weight, scale, **kwargs)
         assert bool(torch.isfinite(result).all())
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+def test_ordered_softmax_dispatch_selects_only_measured_long_candidate(monkeypatch):
+    from comfy_kitchen.backends.triton import mi50_softmax as softmax
+    selected=[]
+    class Kernel:
+        def __init__(self,name):self.name=name
+        def __getitem__(self,grid):
+            def run(*args,**kwargs):selected.append(self.name)
+            return run
+    class Scores:
+        device=torch.device('cuda');dtype=torch.float16;ndim=2
+        def __init__(self,n):self.shape=(1,n)
+        def numel(self):return self.shape[-1]
+        def is_contiguous(self):return True
+    monkeypatch.setattr(torch.version,'hip','test')
+    monkeypatch.setattr(torch.cuda,'get_device_properties',lambda d:type('Device',(),{'gcnArchName':'gfx906'})())
+    monkeypatch.setattr(softmax,'_chunk_store_scale_softmax',Kernel('chunk'))
+    monkeypatch.setattr(softmax,'_cached_scale_softmax',Kernel('cache'))
+    with torch.inference_mode():
+        for n in (5824,10120,40480):
+            scores=Scores(n)
+            assert softmax.scale_softmax_inplace(scores,128**-.5) is scores
+    assert selected==['cache','cache','chunk']
