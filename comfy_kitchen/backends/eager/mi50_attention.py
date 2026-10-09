@@ -1,4 +1,4 @@
-"""Dense video attention for the two validated MI50 LTX refiner shapes.
+"""Dense video attention for the three validated MI50 LTX first-pass/refiner shapes.
 
 All keys participate in every softmax. The ordered softmax path preserves
 ROCm FP16 rounding; the separate fused prototype can differ slightly.
@@ -9,7 +9,7 @@ import os
 
 import torch
 
-VALIDATED_TOKENS = (5824, 40480)
+VALIDATED_TOKENS = (5824, 10120, 40480)
 
 
 DEFAULT_VARIANT = dict(

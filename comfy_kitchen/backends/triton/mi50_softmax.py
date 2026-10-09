@@ -65,7 +65,8 @@ def _cached_scale_softmax(x_ptr, n_columns: gl.constexpr, scale: gl.constexpr):
     row = gl.program_id(0).to(gl.int64)
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [8, 1], [1, 0])
     thread = gl.arange(0, 512, layout=gl.SliceLayout(1, layout))
-    slots0 = gl.arange(0, 64, layout=gl.SliceLayout(0, layout))
+    cache_width: gl.constexpr = 32 if n_columns == 10120 else 64
+    slots0 = gl.arange(0, cache_width, layout=gl.SliceLayout(0, layout))
     slots1 = gl.arange(0, 16, layout=gl.SliceLayout(0, layout)) + 64
     idx0 = thread[:, None] * 8 + slots0[None, :] % 8 + slots0[None, :] // 8 * 4096
     idx1 = thread[:, None] * 8 + slots1[None, :] % 8 + slots1[None, :] // 8 * 4096
@@ -106,7 +107,7 @@ def _cached_scale_softmax(x_ptr, n_columns: gl.constexpr, scale: gl.constexpr):
 
 
 def scale_softmax_inplace(scores, scale):
-    """Exact cached softmax for the two validated LTX gfx906 row lengths.
+    """Exact cached softmax for the three validated LTX gfx906 row lengths.
 
     Rounded FP16 scores stay in registers; exp and ordered FP32 accumulation
     preserve ROCm rounding. No extra score buffer or global scratch is used.
@@ -118,12 +119,12 @@ def scale_softmax_inplace(scores, scale):
         or scores.device.type != "cuda"
         or scores.dtype != torch.float16
         or scores.ndim < 2
-        or scores.shape[-1] not in (5824, 40480)
+        or scores.shape[-1] not in (5824, 10120, 40480)
         or not scores.is_contiguous()
         or not torch.cuda.get_device_properties(scores.device).gcnArchName.startswith("gfx906")
     ):
         raise ValueError(
-            "scale_softmax_inplace requires contiguous 5824/40480-wide FP16 gfx906 inference scores"
+            "scale_softmax_inplace requires contiguous 5824/10120/40480-wide FP16 gfx906 inference scores"
         )
     _cached_scale_softmax[(scores.numel() // scores.shape[-1],)](
         scores, scores.shape[-1], scale, num_warps=8, enable_fp_fusion=False

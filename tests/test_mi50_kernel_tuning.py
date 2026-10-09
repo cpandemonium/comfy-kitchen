@@ -70,7 +70,7 @@ def test_exact_int8_epilogue_and_residual(per_channel, tokens, monkeypatch):
 
 
 @pytest.mark.skipif(not _gfx906(), reason="requires gfx906")
-@pytest.mark.parametrize("tokens", [5824, 40480])
+@pytest.mark.parametrize("tokens", [5824, 10120, 40480])
 def test_ordered_softmax_exact_and_inplace(tokens):
     torch.manual_seed(56)
     with torch.inference_mode():

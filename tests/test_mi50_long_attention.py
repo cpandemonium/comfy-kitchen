@@ -17,9 +17,9 @@ def test_cpu_and_training_keep_original_backend():
 
 
 @pytest.mark.skipif(not _gfx906(), reason="requires HIP gfx906")
-def test_first_pass_and_audio_shapes_keep_original_backend():
+def test_unvalidated_video_and_audio_shapes_keep_original_backend():
     with torch.inference_mode():
-        for n, c, heads in [(10120, 4096, 32), (376, 2048, 32), (1024, 4096, 32)]:
+        for n, c, heads in [(10119, 4096, 32), (376, 2048, 32), (1024, 4096, 32)]:
             q = torch.empty(1, n, c, device="cuda", dtype=torch.float16)
             assert not attention.can_use(q, q, q, heads)
 
@@ -44,7 +44,7 @@ def test_small_refiner_scope_and_budget():
     with torch.inference_mode():
         q = torch.empty(1, 5824, 4096, device="cuda", dtype=torch.float16)
         assert attention.can_use(q, q, q, 32)
-        for n in (1456, 5823, 5825):
+        for n in (1456, 5823, 5825, 10119, 10121):
             other = torch.empty(1, n, 4096, device="cuda", dtype=torch.float16)
             assert not attention.can_use(other, other, other, 32)
         with pytest.raises(ValueError, match="even one attention row"):
@@ -89,3 +89,13 @@ def test_dense_full_refiner_attention_matches_original_fp16_math():
         fused = attention.long_attention(*values, 32, fused_softmax=True)
         assert torch.isfinite(fused).all()
         torch.testing.assert_close(fused, output, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not _gfx906(), reason="requires HIP gfx906")
+def test_large_first_pass_scope():
+    with torch.inference_mode():
+        q = torch.empty(1, 10120, 4096, device="cuda", dtype=torch.float16)
+        assert attention.can_use(q, q, q, 32)
+        for opts in (dict(mask=torch.ones(1, device="cuda")), dict(attn_precision=torch.float32),
+                     dict(skip_reshape=True), dict(enable_gqa=True)):
+            assert not attention.can_use(q, q, q, 32, **opts)

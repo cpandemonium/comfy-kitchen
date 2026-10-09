@@ -21,7 +21,7 @@ input tensors. This is attention memory, not the peak of a full workflow.
 These small inputs are slices of a real N40480 capture, not a capture of the
 latest smaller generation. Tests separately cover random scores, constant
 rows, extreme finite scores, tails, inference/CPU/feature guards, and budget.
-Only the two measured lengths are admitted; other lengths keep their backend.
+Only the three measured lengths are admitted; other lengths keep their backend.
 
 The research PV candidate in samples/mi50_ltx_fp16_cache_pv_probe.py stages
 FP16 P/V tiles in explicit LDS layouts. It compiles without scratch/spills,
@@ -34,3 +34,19 @@ Measurements are isolated attention pairs, not end-to-end sampler speedups.
 Full user generation is the subsequent integration check. Seven targeted
 library tests passed before deployment; final installed checks are recorded
 by the server configuration repository.
+
+
+N10120 first-pass extension on 2026-10-09 uses 32 cached logical slots
+instead of 64 (the second tensor is fully masked at this length). LLVM/AMDGCN
+compile-only gate: VGPR53, private0, spill0, shared32 bytes. The measured
+kernel and prepared production kernel have identical function ASTs.
+Inputs were captured after RMSNorm/RoPE from the real first sampler,
+640x352/361-frame latent, all 32 heads with 128 dimensions. Native baseline
+free-memory selection was fixed to the observed 17.2 GiB (two splits), since
+model weights were unloaded for the isolated attention pair.
+Softmax rows include real queries and a 17-query tail, constant/extreme rows.
+Complete attention output matches native attention_split bitwise and is finite:
+155.678422 -> 138.275779 ms (11.178584% reduction), peak allocated
+6.652344 -> 1.195801 GiB. This is an isolated attention result, not sampler
+or workflow performance. Mask/precision/training/CPU/unvalidated lengths
+retain their original backend. N1456 has not been admitted.
