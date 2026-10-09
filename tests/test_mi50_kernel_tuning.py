@@ -70,19 +70,20 @@ def test_exact_int8_epilogue_and_residual(per_channel, tokens, monkeypatch):
 
 
 @pytest.mark.skipif(not _gfx906(), reason="requires gfx906")
-def test_ordered_softmax_exact_and_inplace():
+@pytest.mark.parametrize("tokens", [5824, 40480])
+def test_ordered_softmax_exact_and_inplace(tokens):
     torch.manual_seed(56)
     with torch.inference_mode():
-        scores = torch.randn(128, 40480, device="cuda", dtype=torch.float16) * 3
+        scores = torch.randn(128, tokens, device="cuda", dtype=torch.float16) * 3
         scores[0].zero_()
         scores[1].fill_(-600)
-        scores[1, 20000] = 600
+        scores[1, tokens - 1] = 600
         reference = (scores * (128**-0.5)).softmax(-1)
         result = scale_softmax_inplace(scores, 128**-0.5)
         assert result.data_ptr() == scores.data_ptr()
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
         with pytest.raises(ValueError, match="contiguous"):
-            scale_softmax_inplace(scores[:, :40000], 128**-0.5)
+            scale_softmax_inplace(scores[:, :-1], 128**-0.5)
 
 
 @pytest.mark.skipif(not _gfx906(), reason="requires gfx906")

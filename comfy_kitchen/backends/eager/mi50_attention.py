@@ -1,13 +1,16 @@
-"""Dense long-video attention for the validated MI50 LTX refiner shape.
+"""Dense video attention for the two validated MI50 LTX refiner shapes.
 
-All keys participate in every softmax. FP16 rounding can differ slightly from
-PyTorch softmax because reduction trees and exp implementations differ.
+All keys participate in every softmax. The ordered softmax path preserves
+ROCm FP16 rounding; the separate fused prototype can differ slightly.
 Triton is used only for a Wave64 scale/softmax kernel, not matrix products.
 """
 from functools import lru_cache
 import os
 
 import torch
+
+VALIDATED_TOKENS = (5824, 40480)
+
 
 DEFAULT_VARIANT = dict(
     head_chunk=8,
@@ -27,7 +30,8 @@ def can_use(q, k, v, heads, mask=None, attn_precision=None, **kwargs):
         and q.dtype == k.dtype == v.dtype == torch.float16
         and q.device == k.device == v.device
         and q.ndim == k.ndim == v.ndim == 3
-        and q.shape == k.shape == v.shape == (1, 40480, 4096)
+        and q.shape == k.shape == v.shape
+        and q.shape[0] == 1 and q.shape[1] in VALIDATED_TOKENS and q.shape[2] == 4096
         and heads == 32 and mask is None
         and attn_precision != torch.float32
         and not kwargs.get("skip_reshape", False)
@@ -74,7 +78,7 @@ def long_attention(q, k, v, heads=32, scale=None, max_score_bytes=2**32,
         raise ValueError("MI50 long_attention requires the validated gfx906 FP16 inference shape")
     if fused_softmax and ordered_softmax:
         raise ValueError("fused_softmax and ordered_softmax are mutually exclusive")
-    if max_score_bytes < 40480 * 2:
+    if max_score_bytes < q.shape[1] * q.element_size():
         raise ValueError("max_score_bytes cannot hold even one attention row")
     b, n, c = q.shape
     d = c // heads
@@ -90,6 +94,8 @@ def long_attention(q, k, v, heads=32, scale=None, max_score_bytes=2**32,
     while head_chunk > 1 and head_chunk * 1024 * n * 2 > max_score_bytes:
         head_chunk //= 2
     query_chunk = min(query_chunk, max(1, max_score_bytes // (head_chunk * n * 2)))
+    if fused_softmax:
+        import triton
     kernel = _softmax_kernel() if fused_softmax else None
     for h in range(0, b*heads, head_chunk):
         for start in range(0, n, query_chunk):
@@ -100,7 +106,8 @@ def long_attention(q, k, v, heads=32, scale=None, max_score_bytes=2**32,
                 probabilities = scale_softmax_inplace(scores, scale)
             elif fused_softmax:
                 probabilities = torch.empty_like(scores)
-                kernel[(scores.numel()//n,)](scores, probabilities, n, scale, 65536, num_warps=8)
+                kernel[(scores.numel()//n,)](scores, probabilities, n, scale,
+                                            triton.next_power_of_2(n), num_warps=8)
             else:
                 scores.mul_(scale)
                 if inplace_softmax:

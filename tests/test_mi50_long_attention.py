@@ -40,6 +40,18 @@ def test_masks_precision_and_other_features_keep_original_backend():
 
 
 @pytest.mark.skipif(not _gfx906(), reason="requires HIP gfx906")
+def test_small_refiner_scope_and_budget():
+    with torch.inference_mode():
+        q = torch.empty(1, 5824, 4096, device="cuda", dtype=torch.float16)
+        assert attention.can_use(q, q, q, 32)
+        for n in (1456, 5823, 5825):
+            other = torch.empty(1, n, 4096, device="cuda", dtype=torch.float16)
+            assert not attention.can_use(other, other, other, 32)
+        with pytest.raises(ValueError, match="even one attention row"):
+            attention.long_attention(q, q, q, max_score_bytes=5824 * 2 - 1)
+
+
+@pytest.mark.skipif(not _gfx906(), reason="requires HIP gfx906")
 def test_dense_full_refiner_attention_matches_original_fp16_math():
     torch.manual_seed(42)
     with torch.inference_mode():
